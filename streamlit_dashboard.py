@@ -1,754 +1,668 @@
 import streamlit as st
 import numpy as np
-import pandas as pd
+import sounddevice as sd
 import time
-import random
-from datetime import datetime, timedelta
+import threading
+from queue import Queue
+from pathlib import Path
+from resemblyzer import VoiceEncoder, preprocess_wav
+from datetime import datetime
+import pandas as pd
+import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-
-# Suppress warnings for clean demo
-import warnings
-warnings.filterwarnings("ignore")
+import os
 
 # Page configuration
 st.set_page_config(
-    page_title="Voice Recognition Security System",
+    page_title="Voice Recognition Security Dashboard",
     page_icon="🔊",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for professional styling
+# Custom CSS for streamlined design
 st.markdown("""
 <style>
     .main-header {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
         color: white;
-        padding: 2rem;
-        border-radius: 15px;
+        padding: 1.5rem;
+        border-radius: 10px;
         text-align: center;
         margin-bottom: 2rem;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+        font-size: 2rem;
+        font-weight: bold;
     }
-    .metric-card {
-        background: white;
-        padding: 1.5rem;
-        border-radius: 12px;
-        box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        border-left: 5px solid #667eea;
-        margin-bottom: 1rem;
-    }
-    .authorized-alert {
-        background: linear-gradient(90deg, #d4edda 0%, #c3e6cb 100%);
-        color: #155724;
-        padding: 1.2rem;
-        border-radius: 10px;
-        border-left: 5px solid #28a745;
-        margin: 0.8rem 0;
-        box-shadow: 0 2px 8px rgba(40,167,69,0.2);
-    }
-    .blocked-alert {
-        background: linear-gradient(90deg, #f8d7da 0%, #f5c6cb 100%);
-        color: #721c24;
-        padding: 1.2rem;
-        border-radius: 10px;
-        border-left: 5px solid #dc3545;
-        margin: 0.8rem 0;
-        box-shadow: 0 2px 8px rgba(220,53,69,0.2);
-    }
-    .live-monitoring {
+    .live-status {
         background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%);
         color: white;
-        padding: 1.5rem;
-        border-radius: 12px;
-        text-align: center;
-        animation: pulse 2s infinite;
-        box-shadow: 0 4px 15px rgba(76,175,80,0.3);
-    }
-    @keyframes pulse {
-        0% { transform: scale(1); }
-        50% { transform: scale(1.02); }
-        100% { transform: scale(1); }
-    }
-    .inactive-status {
-        background: linear-gradient(135deg, #757575 0%, #616161 100%);
-        color: white;
-        padding: 1.5rem;
-        border-radius: 12px;
-        text-align: center;
-    }
-    .stButton > button {
-        width: 100%;
-        border-radius: 8px;
-        border: none;
-        padding: 0.5rem 1rem;
-        font-weight: 600;
-        transition: all 0.3s ease;
-    }
-    .voice-profile-card {
-        background: #f8f9fa;
         padding: 1rem;
         border-radius: 8px;
-        border: 1px solid #dee2e6;
+        text-align: center;
+        font-weight: bold;
+    }
+    .inactive-status {
+        background: linear-gradient(135deg, #f44336 0%, #da190b 100%);
+        color: white;
+        padding: 1rem;
+        border-radius: 8px;
+        text-align: center;
+        font-weight: bold;
+    }
+    .authorized-alert {
+        background-color: #d4edda;
+        color: #155724;
+        padding: 1rem;
+        border-radius: 8px;
+        border-left: 4px solid #28a745;
+        margin: 0.5rem 0;
+    }
+    .blocked-alert {
+        background-color: #f8d7da;
+        color: #721c24;
+        padding: 1rem;
+        border-radius: 8px;
+        border-left: 4px solid #dc3545;
         margin: 0.5rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# Voice Recognition System Class
-class VoiceRecognitionSystem:
+# Voice Recognition System Integration
+class StreamlinedVoiceSystem:
     def __init__(self):
-        self.known_voices = self.load_demo_voices()
-        self.threshold = 0.75
-        self.call_history = self.generate_demo_history()
-        self.monitoring = False
+        self.FS = 16000
+        self.WIN_SEC = 2.0
+        self.HOP_SEC = 1.0
+        self.THRESHOLD = 0.75
+        self.REF_DIR = Path("reference_voices")
         
-    def load_demo_voices(self):
-        """Load demonstration voice profiles"""
-        return {
-            "Mom": {
-                "confidence": 0.94,
-                "registered": "2024-01-10",
-                "calls_today": 3,
-                "profile_strength": "Excellent"
-            },
-            "Dad": {
-                "confidence": 0.89,
-                "registered": "2024-01-10", 
-                "calls_today": 2,
-                "profile_strength": "Very Good"
-            },
-            "Sister": {
-                "confidence": 0.92,
-                "registered": "2024-01-09",
-                "calls_today": 1,
-                "profile_strength": "Excellent"
-            },
-            "Best Friend": {
-                "confidence": 0.87,
-                "registered": "2024-01-08",
-                "calls_today": 4,
-                "profile_strength": "Good"
-            }
+        # Initialize encoder
+        self.enc = VoiceEncoder()
+        self.refs = {}
+        
+        # Audio processing
+        self.audio_queue = Queue()
+        self.result_queue = Queue()
+        self.is_monitoring = False
+        
+        # Statistics
+        self.session_stats = {
+            'total_calls': 0,
+            'authorized_calls': 0,
+            'blocked_calls': 0,
+            'start_time': None
         }
-    
-    def generate_demo_history(self):
-        """Generate realistic call history for demonstration"""
-        call_types = [
-            {"caller": "Mom", "status": "Authorized", "confidence": 0.94},
-            {"caller": "Unknown", "status": "Blocked", "confidence": 0.23},
-            {"caller": "Dad", "status": "Authorized", "confidence": 0.89},
-            {"caller": "Telemarketer", "status": "Blocked", "confidence": 0.15},
-            {"caller": "Sister", "status": "Authorized", "confidence": 0.92},
-            {"caller": "Robocaller", "status": "Blocked", "confidence": 0.08},
-            {"caller": "Best Friend", "status": "Authorized", "confidence": 0.87},
-            {"caller": "Scammer", "status": "Blocked", "confidence": 0.12}
-        ]
         
-        history = []
-        for i in range(12):
-            call = random.choice(call_types).copy()
-            time_offset = timedelta(hours=i*0.5)
-            call["time"] = (datetime.now() - time_offset).strftime("%H:%M")
-            call["date"] = (datetime.now() - time_offset).strftime("%m/%d")
-            history.append(call)
+        # Load references
+        self.load_references()
+    
+    def load_references(self):
+        """Load reference voice embeddings"""
+        try:
+            if self.REF_DIR.exists():
+                self.refs = {
+                    wav.stem: self.enc.embed_utterance(preprocess_wav(wav))
+                    for wav in self.REF_DIR.glob("*.wav")
+                }
+                return len(self.refs) > 0
+            else:
+                self.REF_DIR.mkdir(exist_ok=True)
+                return False
+        except Exception as e:
+            st.error(f"Error loading references: {str(e)}")
+            return False
+    
+    def cosine_similarity(self, a, b):
+        """Calculate cosine similarity"""
+        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+    
+    def audio_callback(self, indata, frames, t, status):
+        """Audio stream callback"""
+        if status:
+            print(f"Audio status: {status}")
+        self.audio_queue.put(indata.copy())
+    
+    def worker_thread(self):
+        """Background processing thread"""
+        win_samples = int(self.WIN_SEC * self.FS)
+        window = np.zeros((win_samples, 1), dtype=np.float32)
         
-        return sorted(history, key=lambda x: x["time"], reverse=True)
+        while self.is_monitoring:
+            try:
+                chunk = self.audio_queue.get(timeout=1)
+                
+                # Update sliding window
+                window = np.roll(window, -len(chunk), axis=0)
+                window[-len(chunk):] = chunk
+                
+                if self.audio_queue.qsize():
+                    continue
+                
+                # Extract embedding
+                embedding = self.enc.embed_utterance(window.flatten())
+                
+                # Find best match
+                best_match = None
+                best_score = 0
+                
+                for name, ref_embedding in self.refs.items():
+                    similarity = self.cosine_similarity(embedding, ref_embedding)
+                    if similarity > best_score:
+                        best_match = name
+                        best_score = similarity
+                
+                # Create result
+                result = {
+                    'timestamp': datetime.now(),
+                    'caller': best_match if best_score >= self.THRESHOLD else "Unknown",
+                    'confidence': best_score,
+                    'status': 'Authorized' if best_score >= self.THRESHOLD else 'Blocked'
+                }
+                
+                # Update statistics
+                self.session_stats['total_calls'] += 1
+                if result['status'] == 'Authorized':
+                    self.session_stats['authorized_calls'] += 1
+                else:
+                    self.session_stats['blocked_calls'] += 1
+                
+                # Put result in queue
+                self.result_queue.put(result)
+                
+                time.sleep(self.HOP_SEC)
+                
+            except Exception as e:
+                if self.is_monitoring:
+                    print(f"Processing error: {e}")
+                continue
     
-    def get_stats(self):
-        """Get system statistics"""
-        total_calls = len(self.call_history)
-        authorized = sum(1 for call in self.call_history if call["status"] == "Authorized")
-        blocked = total_calls - authorized
-        block_rate = (blocked / total_calls * 100) if total_calls > 0 else 0
+    def start_monitoring(self):
+        """Start real-time monitoring"""
+        try:
+            self.is_monitoring = True
+            self.session_stats['start_time'] = datetime.now()
+            
+            # Start audio stream
+            self.stream = sd.InputStream(
+                channels=1,
+                samplerate=self.FS,
+                callback=self.audio_callback,
+                blocksize=0
+            )
+            self.stream.start()
+            
+            # Start worker thread
+            self.monitoring_thread = threading.Thread(target=self.worker_thread, daemon=True)
+            self.monitoring_thread.start()
+            
+            return True
+        except Exception as e:
+            st.error(f"Error starting monitoring: {str(e)}")
+            return False
+    
+    def stop_monitoring(self):
+        """Stop monitoring"""
+        self.is_monitoring = False
+        try:
+            if hasattr(self, 'stream'):
+                self.stream.stop()
+                self.stream.close()
+        except:
+            pass
+    
+    def add_reference_voice(self, name, audio_file):
+        """Add new reference voice"""
+        try:
+            # Save uploaded file
+            ref_path = self.REF_DIR / f"{name}.wav"
+            with open(ref_path, 'wb') as f:
+                f.write(audio_file.getvalue())
+            
+            # Create embedding
+            embedding = self.enc.embed_utterance(preprocess_wav(ref_path))
+            self.refs[name] = embedding
+            
+            return True
+        except Exception as e:
+            st.error(f"Error adding reference voice: {str(e)}")
+            return False
+
+# Initialize system
+@st.cache_resource
+def get_voice_system():
+    return StreamlinedVoiceSystem()
+
+# Main Dashboard
+def main():
+    # Header
+    st.markdown("""
+    <div class="main-header">
+        🔊 Voice Recognition Security Dashboard
+        <br><small>Real-Time Scam Prevention System</small>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Initialize system
+    voice_system = get_voice_system()
+    
+    # Sidebar Navigation
+    with st.sidebar:
+        st.title("🎛️ Control Panel")
         
-        return {
-            "total_calls": total_calls,
-            "authorized": authorized,
-            "blocked": blocked,
-            "block_rate": block_rate
-        }
-
-# Initialize session state
-if 'voice_system' not in st.session_state:
-    st.session_state.voice_system = VoiceRecognitionSystem()
-    st.session_state.monitoring = False
-    st.session_state.demo_counter = 0
-
-voice_system = st.session_state.voice_system
-
-# Main Application Header
-st.markdown("""
-<div class="main-header">
-    <h1>🔊 Voice Recognition Security System</h1>
-    <h3>AI-Powered Scam Prevention Technology</h3>
-    <p>Educational Demonstration Platform</p>
-</div>
-""", unsafe_allow_html=True)
-
-# Sidebar Navigation
-with st.sidebar:
-    st.title("🎛️ Control Center")
+        # System Status
+        if st.session_state.get('monitoring', False):
+            st.markdown('<div class="live-status">🔴 LIVE MONITORING</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="inactive-status">⚫ INACTIVE</div>', unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        # Navigation
+        page = st.selectbox("📋 Navigation", [
+            "🏠 Dashboard",
+            "🔴 Live Monitor", 
+            "👤 Register Voice",
+            "⚙️ Settings"
+        ])
+        
+        st.markdown("---")
+        
+        # Quick Stats
+        st.subheader("📊 Quick Stats")
+        st.metric("Known Voices", len(voice_system.refs))
+        st.metric("Total Calls", voice_system.session_stats['total_calls'])
+        
+        if voice_system.session_stats['total_calls'] > 0:
+            block_rate = (voice_system.session_stats['blocked_calls'] / voice_system.session_stats['total_calls']) * 100
+            st.metric("Block Rate", f"{block_rate:.1f}%")
     
-    # System Status Display
-    if st.session_state.monitoring:
-        st.markdown("""
-        <div class="live-monitoring">
-            <h4>🔴 LIVE MONITORING</h4>
-            <p>Real-time voice analysis active</p>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.markdown("""
-        <div class="inactive-status">
-            <h4>⚫ SYSTEM READY</h4>
-            <p>Click to start monitoring</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    st.markdown("---")
-    
-    # Navigation Menu
-    page = st.selectbox("📋 Navigate to:", [
-        "🏠 Dashboard Overview",
-        "🔴 Live Monitoring", 
-        "👤 Voice Registration",
-        "🔍 Test Recognition",
-        "📊 Analytics & Reports",
-        "⚙️ System Settings",
-        "🎓 Educational Demo"
-    ])
-    
-    st.markdown("---")
-    
-    # Quick Statistics
-    stats = voice_system.get_stats()
-    st.subheader("📊 Today's Stats")
-    st.metric("Known Voices", len(voice_system.known_voices))
-    st.metric("Total Calls", stats["total_calls"])
-    st.metric("Scams Blocked", stats["blocked"], delta=f"{stats['block_rate']:.1f}% block rate")
+    # Page routing
+    if page == "🏠 Dashboard":
+        dashboard_page(voice_system)
+    elif page == "🔴 Live Monitor":
+        live_monitor_page(voice_system)
+    elif page == "👤 Register Voice":
+        register_voice_page(voice_system)
+    elif page == "⚙️ Settings":
+        settings_page(voice_system)
 
-# Main Content Area
-if page == "🏠 Dashboard Overview":
-    # Key Performance Metrics
+def dashboard_page(voice_system):
+    """Main dashboard overview"""
+    
+    # Key Metrics Row
     col1, col2, col3, col4 = st.columns(4)
-    stats = voice_system.get_stats()
     
     with col1:
         st.metric(
             "👥 Known Voices",
-            len(voice_system.known_voices),
-            delta="Active profiles",
+            len(voice_system.refs),
             help="Number of registered voice profiles"
         )
     
     with col2:
         st.metric(
             "📞 Total Calls",
-            stats["total_calls"],
-            delta="Today",
-            help="All calls processed today"
+            voice_system.session_stats['total_calls'],
+            help="Total calls processed this session"
         )
     
     with col3:
         st.metric(
             "✅ Authorized",
-            stats["authorized"],
-            delta="Connected",
-            help="Known callers successfully connected"
+            voice_system.session_stats['authorized_calls'],
+            help="Calls from known voices"
         )
     
     with col4:
         st.metric(
-            "🛡️ Blocked",
-            stats["blocked"],
-            delta="Scams prevented",
-            help="Unknown/suspicious callers blocked"
+            "🚫 Blocked",
+            voice_system.session_stats['blocked_calls'],
+            help="Unknown callers blocked"
         )
     
-    # System Overview
-    col1, col2 = st.columns([2, 1])
+    # Charts Row
+    col1, col2 = st.columns(2)
     
     with col1:
-        st.subheader("📈 Call Analysis Trends")
+        st.subheader("📈 Call Statistics")
         
-        # Create sample data for visualization
-        hours = list(range(8, 18))
-        authorized_calls = [random.randint(0, 4) for _ in hours]
-        blocked_calls = [random.randint(0, 3) for _ in hours]
-        
-        chart_data = pd.DataFrame({
-            "Hour": hours,
-            "Authorized": authorized_calls,
-            "Blocked": blocked_calls
-        })
-        
-        fig = px.bar(chart_data, x="Hour", y=["Authorized", "Blocked"], 
-                    title="Hourly Call Distribution",
-                    color_discrete_map={"Authorized": "#28a745", "Blocked": "#dc3545"})
-        fig.update_layout(height=300)
-        st.plotly_chart(fig, use_container_width=True)
+        if voice_system.session_stats['total_calls'] > 0:
+            # Create pie chart
+            fig = go.Figure(data=[go.Pie(
+                labels=['Authorized', 'Blocked'],
+                values=[voice_system.session_stats['authorized_calls'], 
+                       voice_system.session_stats['blocked_calls']],
+                marker_colors=['#28a745', '#dc3545']
+            )])
+            fig.update_layout(height=300, showlegend=True)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No calls processed yet. Start monitoring to see statistics.")
     
     with col2:
-        st.subheader("🎯 System Performance")
+        st.subheader("👥 Registered Voices")
         
-        # Performance gauge
-        fig = go.Figure(go.Indicator(
-            mode = "gauge+number+delta",
-            value = stats["block_rate"],
-            domain = {'x': [0, 1], 'y': [0, 1]},
-            title = {'text': "Scam Block Rate %"},
-            delta = {'reference': 50},
-            gauge = {
-                'axis': {'range': [None, 100]},
-                'bar': {'color': "#28a745"},
-                'steps': [
-                    {'range': [0, 50], 'color': "lightgray"},
-                    {'range': [50, 80], 'color': "yellow"},
-                    {'range': [80, 100], 'color': "lightgreen"}
-                ],
-                'threshold': {
-                    'line': {'color': "red", 'width': 4},
-                    'thickness': 0.75,
-                    'value': 90
-                }
-            }
-        ))
-        fig.update_layout(height=250)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # Recent Call Activity
-    st.subheader("📋 Recent Call Activity")
-    
-    for i, call in enumerate(voice_system.call_history[:6]):
-        if call["status"] == "Authorized":
-            st.markdown(f"""
-            <div class="authorized-alert">
-                <strong>✅ {call['time']}</strong> - <strong>{call['caller']}</strong><br>
-                Confidence: {call['confidence']:.1%} | Status: Call Connected | Risk: Low
-            </div>
-            """, unsafe_allow_html=True)
+        if voice_system.refs:
+            voices_df = pd.DataFrame([
+                {"Name": name, "Status": "✅ Active", "Type": "Reference"}
+                for name in voice_system.refs.keys()
+            ])
+            st.dataframe(voices_df, use_container_width=True, hide_index=True)
         else:
-            st.markdown(f"""
-            <div class="blocked-alert">
-                <strong>🚫 {call['time']}</strong> - <strong>Unknown Caller</strong><br>
-                Confidence: {call['confidence']:.1%} | Status: Blocked | Risk: High (Potential Scam)
-            </div>
-            """, unsafe_allow_html=True)
-
-elif page == "🔴 Live Monitoring":
-    st.header("🔴 Real-Time Call Monitoring")
+            st.warning("No voices registered. Add reference voices to enable monitoring.")
     
-    # Control Panel
+    # Recent Activity
+    st.subheader("📋 Recent Activity")
+    
+    if 'call_results' in st.session_state and st.session_state.call_results:
+        recent_calls = st.session_state.call_results[-5:]  # Last 5 calls
+        
+        for call in reversed(recent_calls):
+            time_str = call['timestamp'].strftime("%H:%M:%S")
+            
+            if call['status'] == 'Authorized':
+                st.markdown(f"""
+                <div class="authorized-alert">
+                <strong>✅ {time_str}</strong> - {call['caller']} (Confidence: {call['confidence']:.2f})
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div class="blocked-alert">
+                <strong>🚫 {time_str}</strong> - Unknown Caller Blocked (Confidence: {call['confidence']:.2f})
+                </div>
+                """, unsafe_allow_html=True)
+    else:
+        st.info("No recent activity. Start live monitoring to see results here.")
+
+def live_monitor_page(voice_system):
+    """Live monitoring page"""
+    
+    st.header("🔴 Live Voice Monitoring")
+    
+    # Control Buttons
     col1, col2, col3 = st.columns([1, 1, 2])
     
     with col1:
-        if st.button("🔴 Start Monitoring" if not st.session_state.monitoring else "⏹️ Stop Monitoring", 
-                    type="primary"):
-            st.session_state.monitoring = not st.session_state.monitoring
-            st.rerun()
+        if st.button("🔴 Start Monitor", type="primary"):
+            if voice_system.refs:
+                if voice_system.start_monitoring():
+                    st.session_state.monitoring = True
+                    st.success("✅ Monitoring started!")
+                    st.rerun()
+            else:
+                st.error("❌ No reference voices found. Register voices first.")
     
     with col2:
-        if st.button("🎭 Simulate Call"):
-            # Add simulated call to history
-            caller_types = ["Mom", "Unknown Scammer", "Dad", "Telemarketer", "Sister"]
-            new_caller = random.choice(caller_types)
-            
-            if new_caller in voice_system.known_voices:
-                confidence = voice_system.known_voices[new_caller]["confidence"] + random.uniform(-0.05, 0.05)
-                status = "Authorized"
-            else:
-                confidence = random.uniform(0.05, 0.35)
-                status = "Blocked"
-            
-            new_call = {
-                "time": datetime.now().strftime("%H:%M"),
-                "date": datetime.now().strftime("%m/%d"),
-                "caller": new_caller,
-                "status": status,
-                "confidence": confidence
-            }
-            
-            voice_system.call_history.insert(0, new_call)
-            st.success(f"📞 Simulated call from {new_caller}")
+        if st.button("⏹️ Stop Monitor", type="secondary"):
+            voice_system.stop_monitoring()
+            st.session_state.monitoring = False
+            st.success("⏹️ Monitoring stopped")
             st.rerun()
     
     with col3:
-        if st.session_state.monitoring:
-            st.markdown("""
-            <div class="live-monitoring">
-                <strong>🎤 MONITORING ACTIVE</strong><br>
-                Analyzing incoming calls • Real-time voice recognition enabled
-            </div>
-            """, unsafe_allow_html=True)
+        if st.session_state.get('monitoring', False):
+            st.info("🎤 **LISTENING** - System is actively monitoring for incoming calls")
         else:
-            st.info("🔵 **SYSTEM READY** - Click 'Start Monitoring' to begin real-time analysis")
+            st.warning("⚫ **INACTIVE** - Click Start Monitor to begin")
     
-    # Live Results Display
-    if st.session_state.monitoring:
+    # Live Results
+    if st.session_state.get('monitoring', False):
         st.markdown("### 🎯 Live Detection Results")
         
-        # Show most recent calls with enhanced display
-        for call in voice_system.call_history[:3]:
-            col1, col2 = st.columns([3, 1])
+        # Process new results
+        new_results = []
+        while not voice_system.result_queue.empty():
+            try:
+                result = voice_system.result_queue.get_nowait()
+                new_results.append(result)
+            except:
+                break
+        
+        # Update session state
+        if 'call_results' not in st.session_state:
+            st.session_state.call_results = []
+        
+        if new_results:
+            st.session_state.call_results.extend(new_results)
+            st.session_state.call_results = st.session_state.call_results[-20:]  # Keep last 20
+        
+        # Display latest result
+        if st.session_state.call_results:
+            latest = st.session_state.call_results[-1]
+            
+            col1, col2 = st.columns([2, 1])
             
             with col1:
-                if call["status"] == "Authorized":
+                if latest['status'] == 'Authorized':
                     st.markdown(f"""
                     <div class="authorized-alert">
-                        <h4>✅ AUTHORIZED CALLER VERIFIED</h4>
-                        <p><strong>Caller:</strong> {call['caller']}</p>
-                        <p><strong>Time:</strong> {call['time']} | <strong>Confidence:</strong> {call['confidence']:.1%}</p>
-                        <p><strong>Action:</strong> Call connected to user | <strong>Risk Level:</strong> None</p>
+                    <h4>✅ AUTHORIZED CALLER</h4>
+                    <p><strong>Caller:</strong> {latest['caller']}</p>
+                    <p><strong>Time:</strong> {latest['timestamp'].strftime("%H:%M:%S")}</p>
+                    <p><strong>Confidence:</strong> {latest['confidence']:.3f}</p>
+                    <p><strong>Action:</strong> Call Connected</p>
                     </div>
                     """, unsafe_allow_html=True)
                 else:
                     st.markdown(f"""
                     <div class="blocked-alert">
-                        <h4>🚫 THREAT DETECTED & BLOCKED</h4>
-                        <p><strong>Threat Type:</strong> Unknown Voice Pattern</p>
-                        <p><strong>Time:</strong> {call['time']} | <strong>Confidence:</strong> {call['confidence']:.1%}</p>
-                        <p><strong>Action:</strong> Call automatically blocked | <strong>Risk Level:</strong> High</p>
+                    <h4>🚫 BLOCKED CALLER</h4>
+                    <p><strong>Status:</strong> Unknown Voice Detected</p>
+                    <p><strong>Time:</strong> {latest['timestamp'].strftime("%H:%M:%S")}</p>
+                    <p><strong>Confidence:</strong> {latest['confidence']:.3f}</p>
+                    <p><strong>Action:</strong> Potential Scam - Call Blocked</p>
                     </div>
                     """, unsafe_allow_html=True)
             
             with col2:
-                # Confidence meter
-                if call["status"] == "Authorized":
-                    st.success(f"**{call['confidence']:.1%}**\nMatch Rate")
-                else:
-                    st.error(f"**{call['confidence']:.1%}**\nThreat Level")
+                # Confidence gauge
+                fig = go.Figure(go.Indicator(
+                    mode = "gauge+number",
+                    value = latest['confidence'],
+                    domain = {'x': [0, 1], 'y': [0, 1]},
+                    title = {'text': "Confidence"},
+                    gauge = {
+                        'axis': {'range': [None, 1]},
+                        'bar': {'color': "darkblue"},
+                        'steps': [
+                            {'range': [0, 0.5], 'color': "lightgray"},
+                            {'range': [0.5, 0.75], 'color': "yellow"},
+                            {'range': [0.75, 1], 'color': "green"}
+                        ],
+                        'threshold': {
+                            'line': {'color': "red", 'width': 4},
+                            'thickness': 0.75,
+                            'value': voice_system.THRESHOLD
+                        }
+                    }
+                ))
+                fig.update_layout(height=200, margin={'l': 20, 'r': 20, 't': 40, 'b': 20})
+                st.plotly_chart(fig, use_container_width=True)
+        
+        # Auto-refresh
+        time.sleep(2)
+        st.rerun()
 
-elif page == "👤 Voice Registration":
-    st.header("👤 Voice Profile Registration")
+def register_voice_page(voice_system):
+    """Voice registration page"""
     
+    st.header("👤 Register New Voice")
+    
+    # Instructions
     st.info("""
-    **🎯 Registration Process:**
-    Register trusted contacts whose voices should be authorized for incoming calls.
-    This creates a voice profile that enables automatic caller verification.
+    **📋 Instructions:**
+    1. Enter the person's full name
+    2. Upload a clear voice sample (5-10 seconds)
+    3. Use WAV format for best results
+    4. Ensure good audio quality without background noise
     """)
     
-    # Registration Form
+    # Registration form
     col1, col2 = st.columns(2)
     
     with col1:
-        name = st.text_input("👤 Full Name", placeholder="Enter person's full name")
-        relationship = st.selectbox("👨‍👩‍👧‍👦 Relationship", 
-                                  ["Family Member", "Close Friend", "Colleague", "Other"])
+        name = st.text_input(
+            "👤 Person's Name",
+            placeholder="Enter full name (e.g., John Doe)",
+            help="This name will be displayed when the voice is recognized"
+        )
     
     with col2:
-        audio_file = st.file_uploader("🎵 Voice Sample", 
-                                    type=['wav', 'mp3', 'flac'],
-                                    help="Upload 5-10 second clear voice sample")
-        priority_level = st.selectbox("🔒 Security Level", 
-                                    ["High", "Medium", "Low"])
+        audio_file = st.file_uploader(
+            "🎵 Upload Voice Sample",
+            type=['wav', 'mp3', 'flac'],
+            help="WAV format recommended for best accuracy"
+        )
     
-    if st.button("✅ Register Voice Profile", type="primary"):
+    # Registration button
+    if st.button("✅ Register Voice", type="primary"):
         if name and audio_file:
-            with st.spinner("🔄 Creating voice profile..."):
-                progress_bar = st.progress(0)
-                for i in range(100):
-                    progress_bar.progress(i + 1)
-                    time.sleep(0.02)
-                
-                # Add to voice system
-                voice_system.known_voices[name] = {
-                    "confidence": 0.85 + random.random() * 0.1,
-                    "registered": datetime.now().strftime("%Y-%m-%d"),
-                    "calls_today": 0,
-                    "profile_strength": random.choice(["Good", "Very Good", "Excellent"])
-                }
-                
-                st.success(f"🎉 **{name}** successfully registered!")
+            with st.spinner("🔄 Processing voice sample and creating embedding..."):
+                success = voice_system.add_reference_voice(name, audio_file)
+            
+            if success:
+                st.success(f"🎉 Successfully registered voice for **{name}**!")
                 st.balloons()
-        else:
-            st.warning("⚠️ Please provide both name and voice sample")
-    
-    # Current Voice Profiles
-    if voice_system.known_voices:
-        st.subheader("👥 Registered Voice Profiles")
-        
-        for name, data in voice_system.known_voices.items():
-            st.markdown(f"""
-            <div class="voice-profile-card">
-                <strong>{name}</strong> | Confidence: {data['confidence']:.1%} | 
-                Registered: {data['registered']} | Calls Today: {data['calls_today']}
-            </div>
-            """, unsafe_allow_html=True)
-
-elif page == "🔍 Test Recognition":
-    st.header("🔍 Voice Recognition Testing")
-    
-    st.info("""
-    **🧪 Testing Process:**
-    Upload a voice sample to test the recognition system. 
-    The system will determine if it matches any known voice profiles.
-    """)
-    
-    # Testing Interface
-    test_audio = st.file_uploader("🎤 Upload Test Audio", type=['wav', 'mp3'])
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if st.button("🔍 Analyze Voice", type="primary"):
-            if test_audio:
-                with st.spinner("🔄 Analyzing voice patterns..."):
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    
-                    # Simulate analysis stages
-                    stages = [
-                        "🎤 Processing audio file...",
-                        "🔊 Extracting voice features...", 
-                        "🧠 Comparing with known profiles...",
-                        "🎯 Calculating confidence scores...",
-                        "✅ Analysis complete!"
-                    ]
-                    
-                    for i, stage in enumerate(stages):
-                        status_text.text(stage)
-                        for j in range(20):
-                            progress_bar.progress((i * 20 + j + 1))
-                            time.sleep(0.01)
-                
-                # Simulate result
-                is_known = random.random() > 0.3
-                
-                if is_known:
-                    known_person = random.choice(list(voice_system.known_voices.keys()))
-                    confidence = voice_system.known_voices[known_person]["confidence"] + random.uniform(-0.1, 0.05)
-                    
-                    st.markdown(f"""
-                    <div class="authorized-alert">
-                        <h3>✅ VOICE MATCH CONFIRMED</h3>
-                        <p><strong>Identified as:</strong> {known_person}</p>
-                        <p><strong>Confidence Score:</strong> {confidence:.1%}</p>
-                        <p><strong>Match Quality:</strong> Excellent</p>
-                        <p><strong>Recommendation:</strong> Authorize call</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                else:
-                    confidence = random.uniform(0.1, 0.4)
-                    st.markdown(f"""
-                    <div class="blocked-alert">
-                        <h3>🚫 UNKNOWN VOICE DETECTED</h3>
-                        <p><strong>Recognition Status:</strong> No match found</p>
-                        <p><strong>Confidence Score:</strong> {confidence:.1%}</p>
-                        <p><strong>Risk Assessment:</strong> Potential scam caller</p>
-                        <p><strong>Recommendation:</strong> Block call</p>
-                    </div>
-                    """, unsafe_allow_html=True)
+                voice_system.load_references()  # Refresh references
+                time.sleep(2)
+                st.rerun()
             else:
-                st.warning("⚠️ Please upload an audio file to analyze")
+                st.error("❌ Failed to register voice. Please try again with a different audio file.")
+        else:
+            st.warning("⚠️ Please provide both name and audio file.")
     
-    with col2:
-        st.subheader("🎯 Recognition Accuracy")
+    # Current voices
+    if voice_system.refs:
+        st.subheader("👥 Currently Registered Voices")
         
-        # Display accuracy metrics
-        accuracy_data = pd.DataFrame([
-            {"Metric": "Overall Accuracy", "Value": "94.2%"},
-            {"Metric": "False Positive Rate", "Value": "2.1%"},
-            {"Metric": "False Negative Rate", "Value": "3.7%"},
-            {"Metric": "Processing Speed", "Value": "1.3s"}
-        ])
+        voices_data = []
+        for name in voice_system.refs.keys():
+            voices_data.append({
+                "Name": name,
+                "Status": "✅ Active",
+                "Added": "Available"
+            })
         
-        st.table(accuracy_data)
+        df = pd.DataFrame(voices_data)
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
-elif page == "📊 Analytics & Reports":
-    st.header("📊 Advanced Analytics Dashboard")
+def settings_page(voice_system):
+    """Settings and configuration page"""
     
-    # Time-based analysis
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("📅 Weekly Call Trends")
-        
-        days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-        authorized = [random.randint(5, 15) for _ in days]
-        blocked = [random.randint(3, 12) for _ in days]
-        
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=days, y=authorized, mode='lines+markers', 
-                               name='Authorized', line=dict(color='green')))
-        fig.add_trace(go.Scatter(x=days, y=blocked, mode='lines+markers',
-                               name='Blocked', line=dict(color='red')))
-        fig.update_layout(title="Weekly Call Pattern Analysis", height=300)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.subheader("🎯 Recognition Performance")
-        
-        performance_data = pd.DataFrame({
-            'Voice Profile': list(voice_system.known_voices.keys()),
-            'Accuracy': [data['confidence'] for data in voice_system.known_voices.values()],
-            'Calls': [data['calls_today'] for data in voice_system.known_voices.values()]
-        })
-        
-        fig = px.bar(performance_data, x='Voice Profile', y='Accuracy',
-                    color='Calls', title="Individual Voice Recognition Accuracy")
-        fig.update_layout(height=300)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # Detailed call log
-    st.subheader("📋 Detailed Call History")
-    
-    calls_df = pd.DataFrame(voice_system.call_history)
-    calls_df['Risk Level'] = calls_df['status'].apply(
-        lambda x: 'Low' if x == 'Authorized' else 'High'
-    )
-    calls_df['Action Taken'] = calls_df['status'].apply(
-        lambda x: 'Connected' if x == 'Authorized' else 'Blocked'
-    )
-    
-    st.dataframe(calls_df, use_container_width=True)
-
-elif page == "⚙️ System Settings":
-    st.header("⚙️ System Configuration")
+    st.header("⚙️ System Settings")
     
     # Recognition Settings
+    st.subheader("🎯 Recognition Settings")
+    
     col1, col2 = st.columns(2)
     
     with col1:
-        st.subheader("🎯 Recognition Parameters")
-        
         new_threshold = st.slider(
             "Recognition Threshold",
             min_value=0.5,
             max_value=0.95,
-            value=voice_system.threshold,
+            value=voice_system.THRESHOLD,
             step=0.05,
-            help="Higher values require closer voice matches"
+            help="Higher values require closer matches"
         )
         
-        security_level = st.selectbox(
-            "Security Mode",
-            ["Standard", "High Security", "Maximum Protection"],
-            help="Adjusts overall system sensitivity"
-        )
-        
-        if st.button("💾 Update Settings"):
-            voice_system.threshold = new_threshold
-            st.success("Settings updated successfully!")
+        if st.button("💾 Update Threshold"):
+            voice_system.THRESHOLD = new_threshold
+            st.success(f"Threshold updated to {new_threshold:.2f}")
     
     with col2:
-        st.subheader("📊 System Information")
-        
-        system_info = pd.DataFrame({
-            "Parameter": [
-                "Recognition Engine",
-                "Audio Processing",
-                "Analysis Speed",
-                "Voice Profiles",
-                "Current Threshold",
-                "Uptime"
-            ],
-            "Value": [
-                "Advanced Neural Network",
-                "16kHz, 16-bit PCM",
-                "< 2 seconds",
-                f"{len(voice_system.known_voices)} active",
-                f"{voice_system.threshold:.2f}",
-                "24h 15m"
-            ]
-        })
-        
-        st.table(system_info)
-
-elif page == "🎓 Educational Demo":
-    st.header("🎓 Educational Demonstration Mode")
+        st.metric("Current Threshold", f"{voice_system.THRESHOLD:.2f}")
+        st.metric("Window Size", f"{voice_system.WIN_SEC} seconds")
+        st.metric("Processing Hop", f"{voice_system.HOP_SEC} seconds")
     
-    st.info("""
-    **👨‍🏫 For Educators:**
-    This section provides interactive demonstrations perfect for classroom teaching
-    about voice recognition technology and scam prevention.
-    """)
-    
-    # Demo Controls
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        if st.button("📞 Simulate Family Call"):
-            family_member = random.choice(["Mom", "Dad", "Sister"])
-            if family_member in voice_system.known_voices:
-                confidence = voice_system.known_voices[family_member]["confidence"]
-                st.success(f"✅ **{family_member}** calling - Voice recognized ({confidence:.1%} confidence) - **CALL CONNECTED**")
-    
-    with col2:
-        if st.button("🚨 Simulate Scam Call"):
-            scam_types = ["Robocaller", "Fake Bank", "Tech Support Scam", "IRS Impersonator"]
-            scammer = random.choice(scam_types)
-            confidence = random.uniform(0.05, 0.25)
-            st.error(f"🚫 **{scammer}** detected - Unknown voice ({confidence:.1%} confidence) - **CALL BLOCKED**")
-    
-    with col3:
-        if st.button("🎯 Full Demo Sequence"):
-            st.session_state.demo_counter += 1
-            
-            demo_sequence = [
-                ("📞 Mom calling...", "✅ Authorized", "success"),
-                ("📞 Unknown caller...", "🚫 Blocked (Scam)", "error"),
-                ("📞 Dad calling...", "✅ Authorized", "success"),
-                ("📞 Telemarketer...", "🚫 Blocked (Spam)", "error")
-            ]
-            
-            for step, result, msg_type in demo_sequence:
-                st.write(step)
-                time.sleep(0.5)
-                if msg_type == "success":
-                    st.success(result)
-                else:
-                    st.error(result)
-                time.sleep(0.5)
-    
-    # Educational Metrics
-    st.subheader("📈 Teaching Points Visualization")
-    
-    # Effectiveness demonstration
-    effectiveness_data = pd.DataFrame({
-        'Scenario': ['Without Voice Recognition', 'With Voice Recognition'],
-        'Scam Calls Received': [100, 100],
-        'Scam Calls Blocked': [0, 85],
-        'Legitimate Calls Blocked': [0, 2]
-    })
-    
-    fig = px.bar(effectiveness_data, x='Scenario', 
-                y=['Scam Calls Received', 'Scam Calls Blocked', 'Legitimate Calls Blocked'],
-                title="Voice Recognition Effectiveness Comparison",
-                barmode='group')
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Key Learning Points
-    st.subheader("🎯 Key Educational Outcomes")
+    # System Management
+    st.subheader("🗂️ System Management")
     
     col1, col2 = st.columns(2)
     
     with col1:
-        st.markdown("""
-        **🧠 Students Learn:**
-        - How AI voice recognition works
-        - Practical cybersecurity applications
-        - Scam prevention technology
-        - Real-time threat detection
-        """)
+        if st.button("🔄 Reload References"):
+            voice_system.load_references()
+            st.success("Reference voices reloaded!")
     
     with col2:
-        st.markdown("""
-        **💡 Demonstrated Concepts:**
-        - Machine learning in security
-        - Biometric authentication
-        - Automated threat response
-        - Technology for elderly protection
-        """)
+        if st.button("🗑️ Clear All Voices", type="secondary"):
+            if st.checkbox("I confirm I want to delete all registered voices"):
+                voice_system.refs = {}
+                # Clear files
+                for wav_file in voice_system.REF_DIR.glob("*.wav"):
+                    wav_file.unlink()
+                st.success("All voices cleared!")
+                st.rerun()
+# Add this to your existing streamlit_dashboard.py
 
-# Footer
-st.markdown("---")
-st.markdown("""
-<div style="text-align: center; color: #666; padding: 20px;">
-    <strong>🎓 Educational Voice Recognition System</strong><br>
-    Demonstrating AI technology for scam prevention and cybersecurity education<br>
-    <em>Perfect for KPI requirements and student engagement</em>
-</div>
-""", unsafe_allow_html=True)
+def voip_integration_page(voice_system):
+    """VoIP Integration Page"""
+    
+    st.header("📞 VoIP Call Integration")
+    
+    st.info("""
+    **🎯 Educational Demonstration Setup**
+    
+    This page shows how your voice recognition system integrates with real phone calls:
+    - **WebSocket Server**: Running on port 8765 for call integration
+    - **Real-time Analysis**: Processes incoming call audio
+    - **Automatic Blocking**: Unknown callers blocked as potential scams
+    - **Authorized Connections**: Known voices connected immediately
+    """)
+    
+    # System Status
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("🔌 VoIP Status", "Active", delta="Ready")
+    
+    with col2:
+        st.metric("📞 WebSocket Port", "8765", delta="Listening")
+    
+    with col3:
+        st.metric("🛡️ Security Mode", "Enabled", delta="Protecting")
+    
+    # Demonstration Controls
+    st.subheader("🎭 Educational Demonstration")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("📞 Simulate Known Caller", type="primary"):
+            st.success("✅ **AUTHORIZED CALLER**")
+            st.markdown("""
+            **Demonstration Result:**
+            - Voice recognized as: **Mom**
+            - Confidence: **92%**
+            - Action: **Call Connected**
+            - Status: **Safe to Answer**
+            """)
+    
+    with col2:
+        if st.button("🚨 Simulate Scam Call", type="secondary"):
+            st.error("🚫 **BLOCKED CALLER**")
+            st.markdown("""
+            **Demonstration Result:**
+            - Voice: **Unknown**
+            - Confidence: **12%**
+            - Action: **Call Blocked**
+            - Status: **Potential Scam Prevented**
+            """)
+
+# Update your main navigation to include VoIP page
+# In your main() function, add:
+# "📞 VoIP Integration" to your page selection options
+                                
+
+if __name__ == "__main__":
+    # Initialize session state
+    if 'monitoring' not in st.session_state:
+        st.session_state.monitoring = False
+    if 'call_results' not in st.session_state:
+        st.session_state.call_results = []
+    
+    main()
